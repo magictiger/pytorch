@@ -59,7 +59,7 @@ class TestElementwiseOps(hu.HypothesisTestCase):
 
     @given(n=st.integers(0, 6), m=st.integers(4, 6),
            seed=st.integers(0, 1000), **hu.gcs)
-    @settings(deadline=1000)
+    @settings(deadline=10000)
     def test_log(self, n, m, gc, dc, seed):
         np.random.seed(seed)
         X = np.random.rand(n, m).astype(np.float32) + 1.0
@@ -326,7 +326,7 @@ class TestElementwiseOps(hu.HypothesisTestCase):
 
     @given(n=st.integers(0, 6), m=st.integers(4, 6),
            seed=st.integers(0, 1000), **hu.gcs)
-    @settings(deadline=1000)
+    @settings(deadline=10000)
     def test_swish_gradient_inplace(self, n, m, gc, dc, seed):
         np.random.seed(seed)
 
@@ -354,7 +354,7 @@ class TestElementwiseOps(hu.HypothesisTestCase):
 
     @given(X=hu.tensor(dtype=np.float32), inplace=st.booleans(),
            engine=st.sampled_from(["", "CUDNN"]), **hu.gcs)
-    @settings(deadline=1000)
+    @settings(deadline=10000)
     def test_sigmoid(self, X, inplace, engine, gc, dc):
         op = core.CreateOperator(
             "Sigmoid",
@@ -756,6 +756,34 @@ class TestElementwiseOps(hu.HypothesisTestCase):
             op=op,
             inputs=[X],
             reference=not_op,
+            ensure_outputs_are_inferred=True,
+        )
+        self.assertDeviceChecks(dc, op, [X], [0])
+
+    @given(X=hu.tensor(dtype=np.float32), **hu.gcs)
+    @settings(deadline=10000)
+    def test_log1p(self, X, gc, dc):
+        op = core.CreateOperator(
+            "Log1p",
+            ["X"],
+            ["Y"]
+        )
+
+        def ref_log1p(input):
+            result = np.log1p(input)
+            return (result,)
+
+        def ref_log1p_grad(g_out, outputs, fwd_inputs):
+            result = g_out / (fwd_inputs[0] + 1)
+            return (result,)
+
+        self.assertReferenceChecks(
+            device_option=gc,
+            op=op,
+            inputs=[X],
+            reference=ref_log1p,
+            output_to_grad="Y",
+            grad_reference=ref_log1p_grad,
             ensure_outputs_are_inferred=True,
         )
         self.assertDeviceChecks(dc, op, [X], [0])

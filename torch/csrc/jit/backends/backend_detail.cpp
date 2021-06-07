@@ -1,7 +1,9 @@
 #include <torch/csrc/jit/backends/backend_detail.h>
 
-#include <ATen/core/builtin_function.h>
 #include <ATen/core/jit_type.h>
+#include <torch/csrc/jit/backends/backend.h>
+#include <torch/csrc/jit/backends/backend_debug_handler.h>
+#include <torch/csrc/jit/backends/backend_debug_info.h>
 #include <torch/csrc/jit/backends/backend_resolver.h>
 #include <torch/csrc/jit/frontend/code_template.h>
 
@@ -10,35 +12,6 @@
 namespace torch {
 namespace jit {
 namespace detail {
-c10::FunctionSchema getCompileSchema() {
-  c10::Argument self("self", c10::AnyType::get());
-  c10::Argument mod("processed", c10::AnyType::get());
-  auto any_dict_ty =
-      c10::DictType::create(c10::StringType::get(), c10::AnyType::get());
-  c10::Argument method_compile_spec("method_compile_spec", any_dict_ty);
-  c10::Argument handles("handles", any_dict_ty);
-
-  c10::FunctionSchema compile_schema(
-      "compile",
-      /*overload_name=*/"",
-      /*arguments=*/{self, mod, method_compile_spec},
-      /*returns=*/{handles});
-  return compile_schema;
-}
-
-c10::FunctionSchema getExecuteSchema() {
-  auto any_list_ty = c10::ListType::create(c10::AnyType::get());
-  c10::Argument self("self", c10::AnyType::get());
-  c10::Argument handle("handle", c10::AnyType::get());
-  c10::Argument input("input", any_list_ty);
-  c10::Argument output("output", any_list_ty);
-  return c10::FunctionSchema(
-      "execute",
-      /*overload_name=*/"",
-      /*arguments=*/{self, handle, input},
-      /*returns=*/{output});
-}
-
 namespace {
 std::unordered_map<std::string, BackendPreprocessFunction>&
 backendPreprocessFunctions() {
@@ -79,11 +52,7 @@ Module codegen_backend_module(
     const c10::Dict<IValue, IValue>& method_compile_spec,
     const c10::DictTypePtr& any_dict_ty) {
   const c10::QualifiedName qual_backend_name(
-      {"__torch__",
-       "torch",
-       "classes",
-       detail::kBackendsNamespace,
-       backend_name});
+      {"__torch__", "torch", "classes", kBackendsNamespace, backend_name});
   // TODO: Validate method_compile_spec.
 
   // Clone orig_module to make sure backend transformation is
@@ -95,6 +64,12 @@ Module codegen_backend_module(
       "torch.jit." + backend_name + "LoweredModule",
       std::make_shared<CompilationUnit>(),
       /*shouldMangle=*/true);
+
+  // 1. Initialized debug info recorder.
+  // 2. Later call debug_info_recorder.stopRecording() to gather
+  //    recorded debug info and save it in __backend_debug_info.
+  BackendDebugInfoRecorder debug_info_recorder;
+  WithBackendDebugInfoRecorder recorder_context(&debug_info_recorder);
 
   // Generate attributes.
   // This is the preprocessed module.
@@ -147,12 +122,66 @@ Module codegen_backend_module(
   loweredModule.define(
       create_backend_ct.format(create_backend_te), loweredModuleResolver());
 
+  // Helper function to expose backend.is_available() to Module generation code.
+  // Assumes self.__backend exists (i.e. __create_backend() has already been
+  // invoked).
+  loweredModule.define(
+      R"(
+            def __is_available(self):
+                return self.__backend.is_available()
+            )",
+      loweredModuleResolver());
+
+  // backend_debug_info_class is an instance of BackendDebugInfo that
+  // stores debug information.
+  // The purpose of this class is to make the debug information available
+  // at model saving time for serializing it outside of the lowered module,
+  // while still tying it to the module's lifetime (so it gets destroyed along
+  // with it).
+  // Whereas this information is not serialized as part of the lowered
+  // module, we still need to provide a valid instance of the
+  // BackendDebugInfo class when the lowered module is deserialized.
+  // Since the deserialized modules does not need this information,
+  // we create a "dummy" instance with no extra code dependencies (to avoid
+  // overhead) when the backend is created in __setstate__.
+  c10::intrusive_ptr<torch::CustomClassHolder> backend_debug_info_class;
+  const c10::QualifiedName backend_debug_info_class_name(
+      {"__torch__",
+       "torch",
+       "classes",
+       kBackendUtilsNamespace,
+       kBackendDebugInfoClass});
+  auto debug_info_cls =
+      getCustomClass(backend_debug_info_class_name.qualifiedName());
+  TORCH_CHECK(debug_info_cls, "BackendDebugInfo class must be available.");
+  loweredModule.register_attribute(
+      "__backend_debug_info",
+      OptionalType::create(debug_info_cls),
+      IValue::make_capsule(backend_debug_info_class));
+  static const auto create_backend_debug_info_ct = CodeTemplate(R"(
+            def __create_backend_debug_info(self):
+                self.__backend_debug_info = $backend_debug_info()
+            )");
+  TemplateEnv create_backend_debug_info_te;
+  create_backend_debug_info_te.s(
+      "backend_debug_info", backend_debug_info_class_name.qualifiedName());
+  loweredModule.define(
+      create_backend_debug_info_ct.format(create_backend_debug_info_te),
+      loweredModuleResolver());
+
   // getstate and setstate are for serialization/deserialization of
   // the LoweredModule.
+  // setstate is in charge of initializing self.__backend by invoking
+  // __create_backend().
   loweredModule.define(
       R"(
             def __getstate__(self):
-                return self.__method_compile_spec, self.__processed_module
+                # The third parameter indicates whether __setstate__ must create
+                # the backend instance. It's hardcoded to True since the only
+                # case it can be false is when __setstate__ is called from
+                # outside the module (at module creation time), because
+                # __create_backed has been called already (also directly).
+                return self.__method_compile_spec, self.__processed_module, True
             )",
       loweredModuleResolver());
 
@@ -161,8 +190,14 @@ Module codegen_backend_module(
             def __setstate__(self, state):
                 self.__method_compile_spec = state[0]
                 self.__processed_module = state[1]
-                self.__create_backend()
-                self.__handles = self.__backend.compile(self.__processed_module, self.__method_compile_spec)
+                # state[2] indicates whether to create the backend instance.
+                if state[2]:
+                    self.__create_backend()
+                    self.__create_backend_debug_info()
+                if self.__backend.is_available() :
+                    self.__handles = self.__backend.compile(self.__processed_module, self.__method_compile_spec)
+                else:
+                    raise Exception("Backend is not available.")
             )",
       loweredModuleResolver());
 
@@ -173,9 +208,12 @@ Module codegen_backend_module(
     static const auto method_ct = CodeTemplate(R"(
             def $method(self${,def_inputs}):
                 typed_inputs: List[Any] = [${fwd_inputs,}]
-                $unpack, = self.__backend.execute(self.__handles["$method"], typed_inputs)
-                ${refine,}
-                return $ret
+                if self.__backend.is_available() :
+                  $unpack, = self.__backend.execute(self.__handles["$method"], typed_inputs)
+                  ${refine,}
+                  return $ret
+                else:
+                  raise Exception("Backend is not available.")
             )");
 
     TemplateEnv method_te;
@@ -264,11 +302,32 @@ Module codegen_backend_module(
     loweredModule.define(method_ct.format(method_te), loweredModuleResolver());
   }
 
-  // Call __setstate__ to ensure that the returned Module is ready to
-  // run.
-  auto state = at::ivalue::Tuple::create(
-      method_compile_spec, loweredModule.attr("__processed_module"));
-  loweredModule.run_method("__setstate__", state);
+  // If backend is available, call __setstate__ to ensure that the returned
+  // Module is ready to run.
+  // Otherwise throw a warning indicating that the resulting Module is not
+  // ready for execution until is loaded to a device with the backend.
+  loweredModule.run_method("__create_backend");
+  if (loweredModule.run_method("__is_available").toBool()) {
+    auto state = at::ivalue::Tuple::create(
+        method_compile_spec,
+        loweredModule.attr("__processed_module"),
+        /*create_backend*/ false);
+    loweredModule.run_method("__setstate__", state);
+  } else {
+    TORCH_WARN(
+        "Backend [",
+        backend_name,
+        "] is not available. Execution of this Module is still possible by "
+        "saving and loading on a device where the backend is available.");
+  }
+
+  // stop debug info recording and get debug_info_map
+  auto debug_info_map = debug_info_recorder.stopRecording();
+  loweredModule.run_method("__create_backend_debug_info");
+  auto backend_debug_info = loweredModule.attr("__backend_debug_info")
+                                .toCustomClass<PyTorchBackendDebugInfo>();
+  backend_debug_info->setDebugInfoMap(std::move(debug_info_map));
+
   return loweredModule;
 }
 } // namespace detail

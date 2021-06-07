@@ -1,6 +1,7 @@
 import io
 import os
 import sys
+import typing
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,6 @@ sys.path.append(pytorch_test_dir)
 from torch.testing._internal.common_utils import suppress_warnings
 from torch.testing._internal.jit_utils import JitTestCase
 from torch.onnx import OperatorExportTypes
-from torch.testing import FileCheck
 
 if __name__ == '__main__':
     raise RuntimeError("This test file is not meant to be run directly, use:\n\n"
@@ -335,32 +335,6 @@ class TestONNXExport(JitTestCase):
             (torch.ones(1, 10, dtype=torch.float), ),
             None, verbose=False, example_outputs=outputs_f2)
 
-    def test_onnx_export_preprocess_decompose_linear(self):
-        def t(x, weight, bias):
-            return torch.nn.functional.linear(x, weight, bias)
-
-        foo = torch.jit.script(t)
-        foo(torch.zeros(2, 4), torch.randn(3, 4), torch.randn(3))
-        # run it twice in case we need to remove profiling nodes
-        graph = foo.graph_for(
-            torch.zeros(2, 4), torch.randn(3, 4), torch.randn(3))
-
-        nodes = []
-        for n in graph.nodes():
-            nodes.append(n.kind())
-        self.assertEqual(nodes, ['aten::linear'])
-        torch._C._jit_pass_onnx_preprocess(graph)
-
-        nodes = []
-        for n in graph.nodes():
-            nodes.append(n.kind())
-            for b in n.blocks():
-                nodes_b = []
-                for n_n in b.nodes():
-                    nodes_b.append(n_n.kind())
-                nodes.append(nodes_b)
-        FileCheck().check("aten::t").check_next("aten::matmul").check_next("aten::add").run(graph)
-
     def test_onnx_export_shape_reshape(self):
         class Foo(torch.nn.Module):
             def forward(self, x):
@@ -408,3 +382,19 @@ class TestONNXExport(JitTestCase):
         f = io.BytesIO()
         torch.onnx.export_to_pretty_string(
             DynamicSliceExportMod(), (input,), f, example_outputs=example_outs, opset_version=10)
+
+    def test_export_dict(self):
+        class DictModule(torch.nn.Module):
+            def forward(self, x_in: torch.Tensor) -> typing.Dict[str, torch.Tensor]:
+                return {"test_key_out": x_in}
+
+        x_in = torch.tensor(1)
+        mod = DictModule()
+        mod.train(False)
+
+        f = io.BytesIO()
+        torch.onnx.export_to_pretty_string(mod, (x_in,), f)
+
+        with self.assertRaisesRegex(RuntimeError, r"DictConstruct.+is not supported."):
+            torch.onnx.export_to_pretty_string(
+                torch.jit.script(mod), (x_in,), f, example_outputs=(mod(x_in),))

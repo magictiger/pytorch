@@ -5,11 +5,13 @@
 #include <ATen/core/Dict.h>
 #include <ATen/core/functional.h>
 #include <c10/util/Exception.h>
+#include <c10/util/irange.h>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/function.h>
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/ir/constants.h>
+#include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/fixup_trace_scope_blocks.h>
 #include <torch/csrc/jit/passes/inliner.h>
@@ -61,6 +63,7 @@ void badArgType(const T& v) {
       ". File a bug report.");
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 thread_local std::shared_ptr<TracingState> tracing_state;
 } // namespace detail
 
@@ -379,7 +382,7 @@ static IValue addInput(
 
     if (input.isTensorList()) {
       auto elems = input.toTensorList();
-      for (size_t i = 0; i < num_elems; i++) {
+      for (const auto i : c10::irange(num_elems)) {
         elems[i] = addInput(
                        state,
                        elems.get(i),
@@ -390,7 +393,7 @@ static IValue addInput(
       return elems;
     } else {
       auto elems = input.toList();
-      for (size_t i = 0; i < num_elems; i++) {
+      for (const auto i : c10::irange(num_elems)) {
         elems[i] = addInput(
             state,
             elems.get(i),
@@ -429,7 +432,14 @@ static void gatherParametersAndBuffers(
     if (isCustomClass(s.value)) {
       tracer::setValueTrace(s.value, trace_get_attr);
     }
-    if (self_ty->getAttribute(s.name)->is_module()) {
+
+    auto attr_type = self_ty->getAttribute(s.name);
+    // Skipping Parameters and Buffers that are behind an `InterfaceType`
+    // because it is illegal for InterfaceType to expose any attribute.
+    // And these attributes should never be used/exposed outside of
+    // InterfaceType'd module anyway.
+    if (attr_type->is_module() &&
+        attr_type->kind() != TypeKind::InterfaceType) {
       gatherParametersAndBuffers(
           state, trace_get_attr, Module(s.value.toObject()), qualname);
     }
@@ -621,13 +631,13 @@ void addInputs(
     const c10::optional<at::Scalar>& value) {
   detail::genericAddOptionalInput(n, name, value);
 }
-void addInputs(Node* n, const char* name, const std::string& value) {
-  detail::genericAddInput(n, value);
+void addInputs(Node* n, const char* name, const c10::string_view value) {
+  detail::genericAddInput(n, std::string(value));
 }
 void addInputs(
     Node* n,
     const char* name,
-    const c10::optional<std::string>& value) {
+    const c10::optional<c10::string_view>& value) {
   detail::genericAddOptionalInput(n, name, value);
 }
 void addInputs(Node* n, const char* name, const at::Tensor& value) {
@@ -860,7 +870,7 @@ autograd::Variable getSizeOf(const autograd::Variable& var, int64_t dim) {
   Variable size_var;
   {
     // Make sure this scalar to tensor isn't traced!
-    at::AutoNonVariableTypeMode guard;
+    at::AutoDispatchBelowADInplaceOrView guard;
     size_var = scalar_to_tensor(at::Scalar(var.size(dim)));
   }
   auto* value = getValueTrace(var);
@@ -905,6 +915,7 @@ void ensureUniqueIfOutOfPlaced(
 ////////////////////////////////////////////////////////////////////////////////
 // Argument stash
 ////////////////////////////////////////////////////////////////////////////////
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 thread_local ArgumentStash ArgumentStash::stash;
 
 void ArgumentStash::stashIntArrayRefElem(
@@ -955,6 +966,7 @@ void ArgumentStash::stashValue(
 ////////////////////////////////////////////////////////////////////////////////
 // no python present so we just do not record source information
 void defaultRecordSourceLocation(Node* n) {}
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<decltype(&defaultRecordSourceLocation)> record_source_location(
     defaultRecordSourceLocation);
 void recordSourceLocation(Node* n) {
@@ -967,6 +979,7 @@ void setRecordSourceLocation(void (*v)(Node*)) {
 std::vector<StackEntry> defaultPythonCallstack() {
   return std::vector<StackEntry>();
 }
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<decltype(&defaultPythonCallstack)> python_callstack_fn(
     defaultPythonCallstack);
 std::vector<StackEntry> pythonCallstack() {
@@ -979,21 +992,26 @@ void setPythonCallstack(std::vector<StackEntry> (*v)()) {
 void defaultWarn(const std::string& str) {
   TORCH_WARN(str);
 }
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<warn_fn_type> warn_callback{defaultWarn};
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 const char* WARN_PYTHON_DATAFLOW =
     " might cause the trace to be incorrect. We can't record the data flow of "
     "Python values, so this value will be treated as a constant in the future. "
     "This means that the trace might not generalize to other inputs!";
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 const char* WARN_CONSTRUCTOR =
     " results are registered as constants in the trace. You can safely ignore this "
     "warning if you use this function to create tensors out of constant variables "
     "that would be the same every time you call this function. In any other case, "
     "this might cause the trace to be incorrect.";
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 const char* WARN_RESIZE =
     " can't be represented in the JIT at the moment, so we won't connect any uses of "
     "this value with its current trace. If you happen to use it again, it will show "
     "up as a constant in the graph.";
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 const char* STRICT_TRACER_MSG =
     " might cause the trace to be incorrect, this is only valid if the container "
     "structure does not change based on the module's inputs. Consider using a constant "

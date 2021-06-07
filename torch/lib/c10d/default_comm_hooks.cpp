@@ -8,34 +8,38 @@ namespace c10d {
 
 c10::intrusive_ptr<c10::ivalue::Future> AllReduceCommHook::runHook(
     GradBucket& bucket) {
-  auto allreduce_work = state_->allreduce(bucket.getTensorsRef());
-
-  auto div_by_process_group_size = [allreduce_work, this]() {
-    auto tensor = allreduce_work->result()[0] / state_->getSize();
+  std::vector<at::Tensor> tensors = {bucket.getTensorRef()};
+  auto allreduce_fut = state_->allreduce(tensors)->getFuture();
+  auto div_by_process_group_size = [size = state_->getSize()](
+        c10::ivalue::Future& allreduce_fut) {
+    auto result = allreduce_fut.value();
+    TORCH_INTERNAL_ASSERT(result.isTensorList(),
+        "ProcessGroup::allreduce should return TensorList");
+    auto tensor = result.toTensorVector()[0] / size;
     return c10::IValue(tensor);
   };
 
-  auto fut = allreduce_work->getFuture();
-  return fut->then(div_by_process_group_size, fut->elementType());
+  return allreduce_fut->then(div_by_process_group_size, allreduce_fut->elementType());
 }
 
 c10::intrusive_ptr<c10::ivalue::Future> FP16CompressCommHook::runHook(
     GradBucket& bucket) {
-  auto& tensors = bucket.getTensorsRef();
-  for (auto& tensor : tensors) {
-    tensor.copy_(tensor.to(torch::kFloat16));
-  }
-  auto allreduce_work = state_->allreduce(tensors);
+  auto& tensor = bucket.getTensorRef();
+  tensor.copy_(tensor.to(torch::kFloat16));
+  std::vector<at::Tensor> tensors = {tensor};
+  auto allreduce_fut = state_->allreduce(tensors)->getFuture();
+  auto decompress_and_div_by_process_group_size =
+      [size = state_->getSize()](c10::ivalue::Future& allreduce_fut) {
+        auto result = allreduce_fut.value();
+        TORCH_INTERNAL_ASSERT(result.isTensorList(),
+            "ProcessGroup::allreduce should return TensorList");
+        auto reduce_tensor = result.toTensorVector()[0];
+        reduce_tensor.copy_(reduce_tensor.to(torch::kFloat) / size);
+        return c10::IValue(reduce_tensor);
+      };
 
-  auto decompress_and_div_by_process_group_size = [allreduce_work, this]() {
-    auto tensor = allreduce_work->result()[0];
-    tensor.copy_(tensor.to(torch::kFloat) / state_->getSize());
-    return c10::IValue(tensor);
-  };
-
-  auto fut = allreduce_work->getFuture();
-  return fut->then(
-      decompress_and_div_by_process_group_size, fut->elementType());
+  return allreduce_fut->then(
+      decompress_and_div_by_process_group_size, allreduce_fut->elementType());
 }
 
 } // namespace c10d
